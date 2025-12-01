@@ -30,6 +30,9 @@ from Modules.diffusion.sampler import DiffusionSampler, ADPM2Sampler, KarrasSche
 
 from optimizers import build_optimizer
 
+
+
+
 # simple fix for dataparallel that allows access to class attributes
 class MyDataParallel(torch.nn.DataParallel):
     def __getattr__(self, name):
@@ -45,6 +48,8 @@ logger.setLevel(logging.DEBUG)
 handler = StreamHandler()
 handler.setLevel(logging.DEBUG)
 logger.addHandler(handler)
+
+
 
 
 @click.command()
@@ -68,7 +73,8 @@ def main(config_path):
 
     epochs = config.get('epochs', 200)
     save_freq = config.get('save_freq', 2)
-    log_interval = config.get('log_interval', 10)
+    # NOTE: Modified log interval for more frequent logging
+    log_interval = config.get('log_interval', 2)
     saving_epoch = config.get('save_freq', 2)
 
     data_params = config.get('data_params', None)
@@ -88,7 +94,19 @@ def main(config_path):
     optimizer_params = Munch(config['optimizer_params'])
     
     train_list, val_list = get_data_path_list(train_path, val_path)
-    device = 'cuda'
+    # ---- MODIFICATION 1: Added MPS and CPU support ----
+    #NOTE: !!! BUT BEAWARE, MPS HAS OUTPUT CHANNEL LIMITATIONS. TRY TO USE CUDA IF POSSIBLE.
+    if torch.backends.mps.is_available():
+        device = torch.device("mps")
+        print("✨ Using Apple Silicon (M3) GPU acceleration via MPS!")
+    elif torch.cuda.is_available():
+        # Fallback check for standard CUDA (not typically applicable to MacBooks)
+        device = torch.device("cuda")
+        print("🚀 Using CUDA GPU acceleration.")
+    else:
+    # Default to CPU if neither GPU option is available
+        device = torch.device("cpu")
+        print("🐌 Using CPU for training.")
 
     train_dataloader = build_dataloader(train_list,
                                         root_path,
@@ -108,7 +126,14 @@ def main(config_path):
                                       num_workers=0,
                                       device=device,
                                       dataset_config={})
+    print('Number of training utterances: %d' % len(train_list))
+    print('Number of validation utterances: %d' % len(val_list))
     
+
+
+    
+
+
     # load pretrained ASR model
     ASR_config = config.get('ASR_config', False)
     ASR_path = config.get('ASR_path', False)
@@ -156,7 +181,12 @@ def main(config_path):
             model.predictor_encoder = copy.deepcopy(model.style_encoder)
         else:
             raise ValueError('You need to specify the path to the first stage model.') 
-
+        
+    # ---- MODIFICATION 2: freeze style encoder ----
+    # NOTE: This might contain the timbre-related style information
+    logger.info("Freezing Acoustic Style Encoder (model.style_encoder) parameters")
+    for param in model.style_encoder.parameters():
+        param.requires_grad = False
     gl = GeneratorLoss(model.mpd, model.msd).to(device)
     dl = DiscriminatorLoss(model.mpd, model.msd).to(device)
     wl = WavLMLoss(model_params.slm.model, 
@@ -181,13 +211,15 @@ def main(config_path):
         "epochs": epochs,
         "steps_per_epoch": len(train_dataloader),
     }
-    scheduler_params_dict= {key: scheduler_params.copy() for key in model}
+    # ---- MODIFICATION 3: exclude style encoder from optimization ----
+    # NOTE: We do not need to optimize the style encoder parameters, this is a safe choice
+    optimizer_model_params = {key: model[key].parameters() for key in model if key != 'style_encoder'} 
+    scheduler_params_dict= {key: scheduler_params.copy() for key in model }
     scheduler_params_dict['bert']['max_lr'] = optimizer_params.bert_lr * 2
     scheduler_params_dict['decoder']['max_lr'] = optimizer_params.ft_lr * 2
-    scheduler_params_dict['style_encoder']['max_lr'] = optimizer_params.ft_lr * 2
+    # scheduler_params_dict['style_encoder']['max_lr'] = optimizer_params.ft_lr * 2
     
-    optimizer = build_optimizer({key: model[key].parameters() for key in model},
-                                          scheduler_params_dict=scheduler_params_dict, lr=optimizer_params.lr)
+    optimizer = build_optimizer(optimizer_model_params, scheduler_params_dict=scheduler_params_dict, lr=optimizer_params.lr)
     
     # adjust BERT learning rate
     for g in optimizer.optimizers['bert'].param_groups:
@@ -198,7 +230,8 @@ def main(config_path):
         g['weight_decay'] = 0.01
         
     # adjust acoustic module learning rate
-    for module in ["decoder", "style_encoder"]:
+    # NOTE: the prosodic style encoder should be updated
+    for module in ["decoder", "predictor_encoder"]:
         for g in optimizer.optimizers[module].param_groups:
             g['betas'] = (0.0, 0.99)
             g['lr'] = optimizer_params.ft_lr
@@ -208,6 +241,7 @@ def main(config_path):
         
     # load models if there is a model
     if load_pretrained:
+        print('Loading pretrained model from %s ...' % config['pretrained_model'])
         model, optimizer, start_epoch, iters = load_checkpoint(model,  optimizer, config['pretrained_model'],
                                     load_only_params=config.get('load_only_params', True))
         
@@ -241,6 +275,7 @@ def main(config_path):
     
     
     for epoch in range(start_epoch, epochs):
+        print('training encoders epoch', epoch + 1)
         running_loss = 0
         start_time = time.time()
 
@@ -254,6 +289,13 @@ def main(config_path):
         model.bert.train()
         model.msd.train()
         model.mpd.train()
+        # ---- MODIFICATION 4: added predictor encoder training ----
+        # NOTE: The predictor encoder is used for prosodic style encoding
+        model.predictor_encoder.train()
+        model.decoder.train()
+        if 'diffusion' in model:
+            model.diffusion.train()
+
 
         for i, batch in enumerate(train_dataloader):
             waves = batch[0]
@@ -275,7 +317,8 @@ def main(config_path):
                 s2s_attn = s2s_attn.transpose(-1, -2)
                 s2s_attn = s2s_attn[..., 1:]
                 s2s_attn = s2s_attn.transpose(-1, -2)
-            except:
+            except Exception as e:
+                print(f"Training batch {i} skipped due to error: {e}")
                 continue
 
             mask_ST = mask_from_lens(s2s_attn, input_lengths, mel_input_length // (2 ** n_down))
@@ -303,9 +346,14 @@ def main(config_path):
                 ss.append(s)
                 s = model.style_encoder(mel.unsqueeze(0).unsqueeze(1))
                 gs.append(s)
-
-            s_dur = torch.stack(ss).squeeze()  # global prosodic styles
-            gs = torch.stack(gs).squeeze() # global acoustic styles
+            # ---- MODIFICATION 5: fixed dimension issue ----
+            # NOTE: There might be (1, 1, n) shape tensor, we need to squeeze it properly, avoiding removing both batch and channel dimensions
+            s_dur = torch.stack(ss)
+            if s_dur.dim() > 1:
+                s_dur = s_dur.squeeze(1)  # global prosodic styles
+            gs = torch.stack(gs)
+            if gs.dim() > 1:
+                gs = gs.squeeze(1)  # global acoustic styles
             s_trg = torch.cat([gs, s_dur], dim=-1).detach() # ground truth for denoiser
 
             bert_dur = model.bert(texts, attention_mask=(~text_mask).int())
@@ -366,6 +414,7 @@ def main(config_path):
                 gt.append(mels[bib, :, (random_start * 2):((random_start+mel_len) * 2)])
                 
                 y = waves[bib][(random_start * 2) * 300:((random_start+mel_len) * 2) * 300]
+                y = y.astype(np.float32)
                 wav.append(torch.from_numpy(y).to(device))
                 
                 # style reference (better to be different from the GT)
@@ -457,13 +506,13 @@ def main(config_path):
             g_loss.backward()
             if torch.isnan(g_loss):
                 from IPython.core.debugger import set_trace
-                set_trace()
+                #set_trace()
 
             optimizer.step('bert_encoder')
             optimizer.step('bert')
             optimizer.step('predictor')
             optimizer.step('predictor_encoder')
-            optimizer.step('style_encoder')
+            #optimizer.step('style_encoder')
             optimizer.step('decoder')
             
             optimizer.step('text_encoder')
@@ -570,15 +619,26 @@ def main(config_path):
         with torch.no_grad():
             iters_test = 0
             for batch_idx, batch in enumerate(val_dataloader):
+                print('Validation batch %d/%d' % (batch_idx + 1, len(val_dataloader)))
                 optimizer.zero_grad()
 
                 try:
+                    
                     waves = batch[0]
                     batch = [b.to(device) for b in batch[1:]]
                     texts, input_lengths, ref_texts, ref_lengths, mels, mel_input_length, ref_mels = batch
+                    # ----------------- DEBUG PRINTS HERE -----------------
+                    #print(f"DEBUG: Current Batch Size: {texts.size(0)}")
+                    #print(f"DEBUG: mel_input_length tensor: {mel_input_length}")
+                    #print(f"DEBUG: Min Mel Length: {mel_input_length.min().item()}")
+                    # ------------------------------------------------------------
                     with torch.no_grad():
-                        mask = length_to_mask(mel_input_length // (2 ** n_down)).to('cuda')
+                        # ---- MODIFICATION 6: modified divice to the device used for mel_input_length ----
+                        #NOTE: This is problem only when using MPS or CPU, we modify it to be more general
+                        mask = length_to_mask(mel_input_length // (2 ** n_down)).to(mel_input_length.device)
+                        print('mel_input_length', mel_input_length)
                         text_mask = length_to_mask(input_lengths).to(texts.device)
+
 
                         _, _, s2s_attn = model.text_aligner(mels, mask, texts)
                         s2s_attn = s2s_attn.transpose(-1, -2)
@@ -604,11 +664,15 @@ def main(config_path):
                         ss.append(s)
                         s = model.style_encoder(mel.unsqueeze(0).unsqueeze(1))
                         gs.append(s)
-
-                    s = torch.stack(ss).squeeze()
-                    gs = torch.stack(gs).squeeze()
+                    #---- MODIFICATION 7: fixed possible dimension issue ----
+                    s = torch.stack(ss)
+                    if s.dim() > 1:
+                        s = s.squeeze(1)
+                    gs = torch.stack(gs)
+                    if gs.dim() > 1:
+                        gs = gs.squeeze(1)
                     s_trg = torch.cat([s, gs], dim=-1).detach()
-
+                    # ----------------------------------------
                     bert_dur = model.bert(texts, attention_mask=(~text_mask).int())
                     d_en = model.bert_encoder(bert_dur).transpose(-1, -2) 
                     d, p = model.predictor(d_en, s, 
@@ -617,6 +681,7 @@ def main(config_path):
                                                         text_mask)
                     # get clips
                     mel_len = int(mel_input_length.min().item() / 2 - 1)
+                    print(f"DEBUG: Calculated Clip Length (mel_len): {mel_len}")
                     en = []
                     gt = []
 
@@ -624,7 +689,18 @@ def main(config_path):
                     wav = []
 
                     for bib in range(len(mel_input_length)):
+
                         mel_length = int(mel_input_length[bib].item() / 2)
+                        # ----------------- DEBUG PRINTS HERE -----------------
+                        # Check the range before the random selection
+                        #clip_range = mel_length - mel_len
+                        
+                        #if clip_range <= 0:
+                            # This sample is too short and is causing a failure!
+                            #print(f"ERROR: Sample {bib} is too short. Available length: {mel_length}, Required clip: {mel_len}")
+                            # Raise a controlled exception to see the exact issue
+                            #raise ValueError("Sample too short for clipping.")
+                        # ------------------------------------------------------------
 
                         random_start = np.random.randint(0, mel_length - mel_len)
                         en.append(asr[bib, :, random_start:random_start+mel_len])
@@ -632,6 +708,9 @@ def main(config_path):
 
                         gt.append(mels[bib, :, (random_start * 2):((random_start+mel_len) * 2)])
                         y = waves[bib][(random_start * 2) * 300:((random_start+mel_len) * 2) * 300]
+                        # ---- MODIFICATION 8:  convert the datatype to float32 for compatibility ----
+                        #NOTE: This problem only happens when using MPS or CPU.
+                        y = y.astype(np.float32)
                         wav.append(torch.from_numpy(y).to(device))
 
                     wav = torch.stack(wav).float().detach()
@@ -670,7 +749,8 @@ def main(config_path):
                     loss_f += (loss_F0).mean()
 
                     iters_test += 1
-                except:
+                except Exception as e:
+                    print(f"Validation batch {batch_idx} skipped due to error: {e}")
                     continue
 
         print('Epochs:', epoch + 1)

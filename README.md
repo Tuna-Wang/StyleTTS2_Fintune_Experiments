@@ -1,5 +1,10 @@
 ## HOW TO USE THE FINETUNED VERSION
-The original StyleTTS2 provided jupyter notebooks for fine-tuning, the file is located in the Colab folder. <font color="red">To avoid timbre feature cloning, we made modifications to the train_finetune.py and models.py, make sure you replace the two files with the files in this branch after git clone the original model.</font> You should make small modifications as well to add in your own training data.  
+We have modified the fine_tining script in the Colab folder. You can run that file directly.  
+
+### What are the modifications
+The goal of this experiments is to obtain audio that contain prosody characteristics of the dataset used for fine-tuning, but the audio should not reflect timbre features from the training dataset.    
+We froze the style encoder.   
+We added extra style vector to blend the voice of the output audio.
 
 ### Suggestions on datasets
 1. The audio data should be saved in a folder named 'wavs' under Data directory.  
